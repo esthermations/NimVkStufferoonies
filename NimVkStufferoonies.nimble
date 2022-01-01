@@ -7,7 +7,6 @@ license       = "MIT"
 srcDir        = "src"
 bin           = @["NimVkStufferoonies"]
 
-
 # Dependencies
 
 requires "nim >= 1.4.2"
