@@ -1,5 +1,5 @@
 import nimgl/[glfw, vulkan]
-from bitops import testBit
+from bitops import bitand
 
 proc keyEventCallback(window: GLFWWindow, key, scancode, action, mods: int32) {.cdecl.} =
   if action == GLFWPress:
@@ -8,7 +8,11 @@ proc keyEventCallback(window: GLFWWindow, key, scancode, action, mods: int32) {.
 
 
 template vkCheck(result: VkResult): untyped =
-  assert result == VK_SUCCESS
+  doAssert result == VK_SUCCESS
+
+
+template vkHasBits(value, mask: untyped): bool =
+  bitand(uint32(value), uint32(mask)) == uint32(value)
 
 
 template isNullHandle(handle: untyped): bool =
@@ -22,6 +26,7 @@ type
     instance  : VkInstance
     surface   : VkSurfaceKHR
     physDev   : VkPhysicalDevice
+    queueIdx  : uint32
     queue     : VkQueue # Graphics and present on the same queue for now
     cmdPool   : VkCommandPool
     swapchain : VkSwapchainKHR
@@ -73,7 +78,6 @@ proc initVulkan(): bool =
     )
 
   vkCheck vkCreateInstance(unsafeAddr createInfo, nil, addr Vk.instance)
-
   echo "Instance created ok"
 
   Vk.window  = glfwCreateWindow(1920, 1080, cstring("Hello"))
@@ -85,7 +89,8 @@ proc initVulkan(): bool =
 
   vkCheck vkEnumeratePhysicalDevices(Vk.instance, addr numPhysicalDevices, nil)
   physicalDevices.setLen numPhysicalDevices
-  vkCheck vkEnumeratePhysicalDevices(Vk.instance, addr numPhysicalDevices, addr physicalDevices[0])
+  vkCheck vkEnumeratePhysicalDevices(
+    Vk.instance, addr numPhysicalDevices, addr physicalDevices[0])
 
   const requiredDeviceExtensions = @[ "VK_KHR_swapchain", "VK_KHR_maintenance1" ]
 
@@ -108,10 +113,11 @@ proc initVulkan(): bool =
         break selectPhysicalDevice
 
   assert not Vk.physDev.isNullHandle
-
-  var queueFamilyIdx: uint32 = high(uint32)
+  echo "Got physical device"
 
   block selectQueueFamily:
+    Vk.queueIdx = high(uint32)
+
     var numQueueFamilies: uint32
     vkGetPhysicalDeviceQueueFamilyProperties(
       Vk.physDev, addr numQueueFamilies, nil)
@@ -123,15 +129,63 @@ proc initVulkan(): bool =
       Vk.physDev, addr numQueueFamilies, addr queueFamilyProps[0])
 
     for i in 0 .. numQueueFamilies:
-      let props = queueFamilyProps[i]
-      if testBit(uint32(props.queueFlags), uint32(VK_QUEUE_GRAPHICS_BIT)) and props.queueCount > 0:
-        queueFamilyIdx = i
+      let
+        props              = queueFamilyProps[i]
+        hasQueuesAvailable = props.queueCount > 0
+        hasGraphicsQueue   = vkHasBits(props.queueFlags, VK_QUEUE_GRAPHICS_BIT)
+
+      if hasQueuesAvailable and hasGraphicsQueue:
+        Vk.queueIdx = i
         break selectQueueFamily
 
-  assert queueFamilyIdx != high(uint32)
+  assert Vk.queueIdx != high(uint32)
+  echo "Using queue family id ", $Vk.queueIdx
+
+  block createQueue:
+    let
+      queuePriorities : array[1, float32] = [ 1.0f ]
+      queueCreateInfo = VkDeviceQueueCreateInfo(
+        sType            : VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        pNext            : nil,
+        flags            : VkDeviceQueueCreateFlags(0),
+        queueFamilyIndex : Vk.queueIdx,
+        queueCount       : uint32(queuePriorities.len),
+        pQueuePriorities : unsafeAddr queuePriorities[0]
+      )
+
+      deviceCreateInfo = VkDeviceCreateInfo(
+        sType                   : VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        pNext                   : nil,
+        flags                   : VkDeviceCreateFlags(0),
+        queueCreateInfoCount    : 1,
+        pQueueCreateInfos       : unsafeAddr queueCreateInfo,
+        enabledLayerCount       : 0,
+        ppEnabledLayerNames     : nil,
+        enabledExtensionCount   : 0,
+        ppEnabledExtensionNames : nil,
+        pEnabledFeatures        : nil
+      )
+
+    vkCheck vkCreateDevice(
+      Vk.physDev, unsafeAddr deviceCreateInfo, nil, addr Vk.device)
+
+  block getQueue:
+    vkGetDeviceQueue(Vk.device, Vk.queueIdx, 0, addr Vk.queue)
+    assert not isNullHandle(Vk.queue)
 
   # TODO
   false
+
+
+proc destroyVulkan() =
+  if not isNullHandle(Vk.device):
+    echo "Destroying VkDevice"
+    vkCheck vkDeviceWaitIdle(Vk.device)
+    vkDestroyDevice(Vk.device, nil)
+
+  if not isNullHandle(Vk.instance):
+    echo "Destroying VkInstance"
+    vkDestroyInstance(Vk.instance, nil)
 
 
 proc main() =
@@ -147,9 +201,11 @@ proc main() =
   discard w.setKeyCallback(keyEventCallback)
   w.makeContextCurrent()
 
-  let vulkanInitOk = initVulkan()
-  assert vulkanInitOk
+  doAssert initVulkan()
 
+  # No main loop yet
+
+  destroyVulkan()
 
 when isMainModule:
   main()
