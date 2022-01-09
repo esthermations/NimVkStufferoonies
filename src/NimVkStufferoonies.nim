@@ -8,11 +8,13 @@ proc keyEventCallback(window: GLFWWindow, key, scancode, action, mods: int32) {.
 
 
 template vkCheck(result: VkResult): untyped =
-  doAssert result == VK_SUCCESS
+  if result != VK_SUCCESS:
+    echo "vkCheck: ", $result
+    doAssert result == VK_SUCCESS
 
 
 template vkHasBits(value, mask: untyped): bool =
-  bitand(uint32(value), uint32(mask)) == uint32(value)
+  bitand(uint32(value), uint32(mask)) == uint32(mask)
 
 
 template isNullHandle(handle: untyped): bool =
@@ -36,12 +38,42 @@ type
 # this doesn't seem too bad.
 var Vk : VulkanState
 
+
+# Forward decls, which for some sad reason are necessary in the year of our
+# lord 2022
+proc initVulkan(): bool
+proc destroyVulkan()
+
+
+proc main() =
+  assert glfwInit()
+
+  glfwWindowHint(GlfwContextVersionMajor, 3)
+  glfwWindowHint(GlfwContextVersionMinor, 3)
+  glfwWindowHint(GlfwClientApi, GlfwNoApi)
+  glfwWindowHint(GlfwResizable, GlFw_FaLsE)
+
+  let w: GLFWWindow = glfwCreateWindow(1280, 720, "EEEEEE")
+  if w == nil: quit(-1)
+
+  discard w.setKeyCallback(keyEventCallback)
+  w.makeContextCurrent()
+
+  doAssert initVulkan()
+
+  # No main loop yet
+
+  destroyVulkan()
+
+
 proc initVulkan(): bool =
   # I usually get these names via macros like VK_KHR_SWAPCHAIN_EXTENSION_NAME
   # in C++ but those don't seem to be defined in nimgl. So I'm just running
   # 'vulkaninfo' on my local machine and putting the strings from that in here.
 
   assert glfwVulkanSupported()
+
+  doAssert vkInit(load1_0 = true, load1_1 = true)
 
   var
     requiredInstanceExtensions = @[ "VK_EXT_debug_utils" ]
@@ -53,12 +85,12 @@ proc initVulkan(): bool =
     glfwInstanceExtensions    : cstringArray
       = glfwGetRequiredInstanceExtensions(addr numGlfwInstanceExtensions)
 
-  for i in 0 .. numGlfwInstanceExtensions:
+  for i in 0 ..< numGlfwInstanceExtensions:
     let ext = $glfwInstanceExtensions[i]
     echo "GLFW requires extension: ", ext
     requiredInstanceExtensions.add ext
 
-  deallocCStringArray glfwInstanceExtensions
+  # deallocCStringArray glfwInstanceExtensions
 
   let
     appInfo = VkApplicationInfo(
@@ -78,7 +110,7 @@ proc initVulkan(): bool =
     )
 
   vkCheck vkCreateInstance(unsafeAddr createInfo, nil, addr Vk.instance)
-  echo "Instance created ok"
+  echo "Created VkInstance"
 
   Vk.window  = glfwCreateWindow(1920, 1080, cstring("Hello"))
   vkCheck glfwCreateWindowSurface(Vk.instance, Vk.window, nil, addr Vk.surface)
@@ -113,7 +145,10 @@ proc initVulkan(): bool =
         break selectPhysicalDevice
 
   assert not Vk.physDev.isNullHandle
-  echo "Got physical device"
+  echo "Created VkPhysicalDevice"
+
+  loadVK_KHR_surface()
+  loadVK_KHR_swapchain()
 
   block selectQueueFamily:
     Vk.queueIdx = high(uint32)
@@ -128,18 +163,23 @@ proc initVulkan(): bool =
     vkGetPhysicalDeviceQueueFamilyProperties(
       Vk.physDev, addr numQueueFamilies, addr queueFamilyProps[0])
 
-    for i in 0 .. numQueueFamilies:
+    for i in 0 ..< numQueueFamilies:
+      var supportsPresent: VkBool32 = VkBool32(VK_FALSE)
+      vkCheck vkGetPhysicalDeviceSurfaceSupportKHR(Vk.physDev, i, Vk.surface, addr supportsPresent)
+
       let
         props              = queueFamilyProps[i]
         hasQueuesAvailable = props.queueCount > 0
         hasGraphicsQueue   = vkHasBits(props.queueFlags, VK_QUEUE_GRAPHICS_BIT)
 
-      if hasQueuesAvailable and hasGraphicsQueue:
+      echo "VkDeviceQueue: Queue ", $i, ": hasQueuesAvailable = ", $hasQueuesAvailable, ", hasGraphicsQueue = ", $hasGraphicsQueue
+
+      if hasQueuesAvailable and hasGraphicsQueue and uint32(supportsPresent) == uint32(VK_TRUE):
         Vk.queueIdx = i
         break selectQueueFamily
 
   assert Vk.queueIdx != high(uint32)
-  echo "Using queue family id ", $Vk.queueIdx
+  echo "VkDeviceQueue: Using queue family id ", $Vk.queueIdx
 
   block createQueue:
     let
@@ -169,12 +209,23 @@ proc initVulkan(): bool =
     vkCheck vkCreateDevice(
       Vk.physDev, unsafeAddr deviceCreateInfo, nil, addr Vk.device)
 
+  echo "Created VkDevice"
+
   block getQueue:
     vkGetDeviceQueue(Vk.device, Vk.queueIdx, 0, addr Vk.queue)
     assert not isNullHandle(Vk.queue)
 
-  # TODO
-  false
+  # TODO:
+  #   - [ ] Create semaphores for image available and rendering complete
+  #   - [ ] Create swapchain with all its images and whatnot
+  #   - [ ] Allocate command buffers
+  #   - [ ] Write some simple shaders
+  #   - [ ] Draw a funglermubffllausenfeeeeeere triangle!!!
+  #
+  # And maybe:
+  #   - [ ] Refactor init/destruct code into a constructor+destructor.
+  #         See: https://nim-lang.org/docs/destructors.html
+  true
 
 
 proc destroyVulkan() =
@@ -183,29 +234,14 @@ proc destroyVulkan() =
     vkCheck vkDeviceWaitIdle(Vk.device)
     vkDestroyDevice(Vk.device, nil)
 
+  if not isNullHandle(Vk.surface):
+    echo "Destroying VkSurfaceKHR"
+    vkDestroySurfaceKHR(Vk.instance, Vk.surface, nil)
+
   if not isNullHandle(Vk.instance):
     echo "Destroying VkInstance"
     vkDestroyInstance(Vk.instance, nil)
 
-
-proc main() =
-  assert glfwInit()
-
-  glfwWindowHint(GlfwContextVersionMajor, 3)
-  glfwWindowHint(GlfwContextVersionMinor, 3)
-  glfwWindowHint(GlfwResizable, GLFW_FALSE)
-
-  let w: GLFWWindow = glfwCreateWindow(1280, 720, "EEEEEE")
-  if w == nil: quit(-1)
-
-  discard w.setKeyCallback(keyEventCallback)
-  w.makeContextCurrent()
-
-  doAssert initVulkan()
-
-  # No main loop yet
-
-  destroyVulkan()
 
 when isMainModule:
   main()
