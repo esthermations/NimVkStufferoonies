@@ -1,6 +1,10 @@
 import nimgl/[glfw, vulkan]
 from bitops import bitand
 
+# Const values that nimgl/vulkan *should* have in it but doesn't for some reason.
+let
+  VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR = cast[VkStructureType](1000001000)
+
 proc keyEventCallback(window: GLFWWindow, key, scancode, action, mods: int32) {.cdecl.} =
   if action == GLFWPress:
     if key == GLFWKey.ESCAPE:
@@ -22,16 +26,22 @@ template isNullHandle(handle: untyped): bool =
 
 
 type
+  VulkanSemaphores = object
+    imageAvailable : VkSemaphore
+    renderFinished : VkSemaphore
+
   VulkanState = object
-    window    : GLFWWindow
-    device    : VkDevice
-    instance  : VkInstance
-    surface   : VkSurfaceKHR
-    physDev   : VkPhysicalDevice
-    queueIdx  : uint32
-    queue     : VkQueue # Graphics and present on the same queue for now
-    cmdPool   : VkCommandPool
-    swapchain : VkSwapchainKHR
+    window     : GLFWWindow
+    device     : VkDevice
+    instance   : VkInstance
+    surface    : VkSurfaceKHR
+    surfaceCapabilities : VkSurfaceCapabilitiesKHR
+    physDev    : VkPhysicalDevice
+    queueIdx   : uint32
+    queue      : VkQueue # Graphics and present on the same queue for now
+    cmdPool    : VkCommandPool
+    swapchain  : VkSwapchainKHR
+    semaphores : VulkanSemaphores
 
 # My global renderer state variable. Could arguably choose a better name -- in
 # Intel's "API Without Secrets" tutorial they just use the name "Vulkan". So
@@ -124,7 +134,11 @@ proc initVulkan(): bool =
   vkCheck vkEnumeratePhysicalDevices(
     Vk.instance, addr numPhysicalDevices, addr physicalDevices[0])
 
-  const requiredDeviceExtensions = @[ "VK_KHR_swapchain", "VK_KHR_maintenance1" ]
+  const requiredDeviceExtensions = @[
+    "VK_KHR_swapchain",
+    "VK_KHR_maintenance1",
+    "VK_EXT_robustness2"
+  ]
 
   block selectPhysicalDevice:
     for dev in physicalDevices:
@@ -215,8 +229,66 @@ proc initVulkan(): bool =
     vkGetDeviceQueue(Vk.device, Vk.queueIdx, 0, addr Vk.queue)
     assert not isNullHandle(Vk.queue)
 
+  block createSemaphores:
+    let createInfo = VkSemaphoreCreateInfo(
+      sType : VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+      pNext : nil,
+      flags : VkSemaphoreCreateFlags(0),
+    )
+
+    vkCheck vkCreateSemaphore(Vk.device, unsafeAddr createInfo, nil, addr Vk.semaphores.imageAvailable)
+    vkCheck vkCreateSemaphore(Vk.device, unsafeAddr createInfo, nil, addr Vk.semaphores.renderFinished)
+
+  block createSwapchain:
+
+    block getSurfaceCapabilities:
+      vkCheck vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+        Vk.physDev,
+        Vk.surface,
+        addr Vk.surfaceCapabilities
+      )
+      echo "Got surface capabilities: ", $Vk.surfaceCapabilities
+
+    var numFormats : uint32 = 0
+
+    vkCheck vkGetPhysicalDeviceSurfaceFormatsKHR(Vk.physDev, Vk.surface, addr numFormats, nil)
+    assert numFormats > 0
+
+    var availableFormats = newSeq[VkSurfaceFormatKHR](numFormats)
+
+    vkCheck vkGetPhysicalDeviceSurfaceFormatsKHR(Vk.physDev, Vk.surface, addr numFormats, addr availableFormats[0])
+    assert availableFormats.len > 0
+
+    echo "Got available formats"
+
+    var createInfo = VkSwapchainCreateInfoKHR(
+      sType                 : VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+      pNext                 : nil,
+      flags                 : VkSwapchainCreateFlagsKHR(0),
+      surface               : Vk.surface,
+      minImageCount         : Vk.surfaceCapabilities.maxImageCount,
+      imageFormat           : availableFormats[0].format, # Just use the first one...
+      imageColorSpace       : availableFormats[0].colorSpace,
+      imageExtent           : Vk.surfaceCapabilities.minImageExtent,
+      imageArrayLayers      : 1,
+      imageUsage            : VkImageUsageFlags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
+      imageSharingMode      : VK_SHARING_MODE_EXCLUSIVE,
+      queueFamilyIndexCount : 0,
+      pQueueFamilyIndices   : nil,
+      compositeAlpha        : VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+      presentMode           : VK_PRESENT_MODE_FIFO_KHR,
+      clipped               : VkBool32(VK_TRUE)
+    )
+
+    vkCheck vkCreateSwapchainKHR(
+      Vk.device,
+      addr createInfo,
+      nil,
+      addr Vk.swapchain
+    )
+
   # TODO:
-  #   - [ ] Create semaphores for image available and rendering complete
+  #   - [x] Create semaphores for image available and rendering complete
   #   - [ ] Create swapchain with all its images and whatnot
   #   - [ ] Allocate command buffers
   #   - [ ] Write some simple shaders
@@ -229,6 +301,15 @@ proc initVulkan(): bool =
 
 
 proc destroyVulkan() =
+
+  if not isNullHandle(Vk.semaphores.imageAvailable):
+    echo "Destroying VkSemaphore ImageAvailable"
+    vkDestroySemaphore(Vk.device, Vk.semaphores.imageAvailable, nil)
+
+  if not isNullHandle(Vk.semaphores.renderFinished):
+    echo "Destroying VkSemaphore RenderFinished"
+    vkDestroySemaphore(Vk.device, Vk.semaphores.renderFinished, nil)
+
   if not isNullHandle(Vk.device):
     echo "Destroying VkDevice"
     vkCheck vkDeviceWaitIdle(Vk.device)
@@ -241,6 +322,7 @@ proc destroyVulkan() =
   if not isNullHandle(Vk.instance):
     echo "Destroying VkInstance"
     vkDestroyInstance(Vk.instance, nil)
+
 
 
 when isMainModule:
