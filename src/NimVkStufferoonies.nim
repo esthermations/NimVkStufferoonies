@@ -7,19 +7,17 @@ proc keyEventCallback(window: GLFWWindow, key, scancode, action, mods: int32) {.
       window.setWindowShouldClose(true)
 
 
-template vkCheck(result: VkResult): untyped =
+template vkCheck(result: VkResult) =
   if result != VK_SUCCESS:
     echo "vkCheck: ", $result
     doAssert result == VK_SUCCESS
 
-
-template vkHasBits(value, mask: untyped): bool =
+func vkHasBits[T1, T2](value: T1, mask: T2): bool =
   bitand(uint32(value), uint32(mask)) == uint32(mask)
 
 
-template isNullHandle(handle: untyped): bool =
+func isNullHandle[T](handle: T): bool =
   VkHandle(handle) == VkHandle(0)
-
 
 type
   VulkanState = object
@@ -32,11 +30,13 @@ type
     queue     : VkQueue # Graphics and present on the same queue for now
     cmdPool   : VkCommandPool
     swapchain : VkSwapchainKHR
+    semImageWritable : VkSemaphore
+    semRenderDone    : VkSemaphore
 
 # My global renderer state variable. Could arguably choose a better name -- in
 # Intel's "API Without Secrets" tutorial they just use the name "Vulkan". So
 # this doesn't seem too bad.
-var Vk : VulkanState
+var vk : VulkanState
 
 
 # Forward decls, which for some sad reason are necessary in the year of our
@@ -109,20 +109,20 @@ proc initVulkan(): bool =
       # The 'allocCStringArray' calls in here are leaks. But I don't care :)
     )
 
-  vkCheck vkCreateInstance(unsafeAddr createInfo, nil, addr Vk.instance)
+  vkCheck vkCreateInstance(unsafeAddr createInfo, nil, addr vk.instance)
   echo "Created VkInstance"
 
-  Vk.window  = glfwCreateWindow(1920, 1080, cstring("Hello"))
-  vkCheck glfwCreateWindowSurface(Vk.instance, Vk.window, nil, addr Vk.surface)
+  vk.window  = glfwCreateWindow(1920, 1080, cstring("Hello"))
+  vkCheck glfwCreateWindowSurface(vk.instance, vk.window, nil, addr vk.surface)
 
   var
     physicalDevices    : seq[VkPhysicalDevice]
     numPhysicalDevices : uint32 = 0
 
-  vkCheck vkEnumeratePhysicalDevices(Vk.instance, addr numPhysicalDevices, nil)
+  vkCheck vkEnumeratePhysicalDevices(vk.instance, addr numPhysicalDevices, nil)
   physicalDevices.setLen numPhysicalDevices
   vkCheck vkEnumeratePhysicalDevices(
-    Vk.instance, addr numPhysicalDevices, addr physicalDevices[0])
+    vk.instance, addr numPhysicalDevices, addr physicalDevices[0])
 
   const requiredDeviceExtensions = @[ "VK_KHR_swapchain", "VK_KHR_maintenance1" ]
 
@@ -136,36 +136,36 @@ proc initVulkan(): bool =
         vkGetPhysicalDeviceProperties(dev, addr props)
         vkGetPhysicalDeviceFeatures(dev, addr feats)
 
-        # Probably all I care about... I reckon I'll use 1.2.182 or whatever the
-        # latest stable release is.
+        # Probably all I care about... I reckon I'll use 1.2.182 or whatever
+        # the latest stable release is.
         if vkVersionMajor(props.apiVersion) < 1: continue
 
         # Passed all checks, use this one
-        Vk.physDev = dev
+        vk.physDev = dev
         break selectPhysicalDevice
 
-  assert not Vk.physDev.isNullHandle
+  assert not vk.physDev.isNullHandle
   echo "Created VkPhysicalDevice"
 
   loadVK_KHR_surface()
   loadVK_KHR_swapchain()
 
   block selectQueueFamily:
-    Vk.queueIdx = high(uint32)
+    vk.queueIdx = high(uint32)
 
     var numQueueFamilies: uint32
     vkGetPhysicalDeviceQueueFamilyProperties(
-      Vk.physDev, addr numQueueFamilies, nil)
+      vk.physDev, addr numQueueFamilies, nil)
     assert numQueueFamilies > 0
 
     var queueFamilyProps: seq[VkQueueFamilyProperties]
     queueFamilyProps.setLen numQueueFamilies
     vkGetPhysicalDeviceQueueFamilyProperties(
-      Vk.physDev, addr numQueueFamilies, addr queueFamilyProps[0])
+      vk.physDev, addr numQueueFamilies, addr queueFamilyProps[0])
 
     for i in 0 ..< numQueueFamilies:
       var supportsPresent: VkBool32 = VkBool32(VK_FALSE)
-      vkCheck vkGetPhysicalDeviceSurfaceSupportKHR(Vk.physDev, i, Vk.surface, addr supportsPresent)
+      vkCheck vkGetPhysicalDeviceSurfaceSupportKHR(vk.physDev, i, vk.surface, addr supportsPresent)
 
       let
         props              = queueFamilyProps[i]
@@ -175,11 +175,11 @@ proc initVulkan(): bool =
       echo "VkDeviceQueue: Queue ", $i, ": hasQueuesAvailable = ", $hasQueuesAvailable, ", hasGraphicsQueue = ", $hasGraphicsQueue
 
       if hasQueuesAvailable and hasGraphicsQueue and uint32(supportsPresent) == uint32(VK_TRUE):
-        Vk.queueIdx = i
+        vk.queueIdx = i
         break selectQueueFamily
 
-  assert Vk.queueIdx != high(uint32)
-  echo "VkDeviceQueue: Using queue family id ", $Vk.queueIdx
+  assert vk.queueIdx != high(uint32)
+  echo "VkDeviceQueue: Using queue family id ", $vk.queueIdx
 
   block createQueue:
     let
@@ -188,7 +188,7 @@ proc initVulkan(): bool =
         sType            : VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         pNext            : nil,
         flags            : VkDeviceQueueCreateFlags(0),
-        queueFamilyIndex : Vk.queueIdx,
+        queueFamilyIndex : vk.queueIdx,
         queueCount       : uint32(queuePriorities.len),
         pQueuePriorities : unsafeAddr queuePriorities[0]
       )
@@ -207,13 +207,13 @@ proc initVulkan(): bool =
       )
 
     vkCheck vkCreateDevice(
-      Vk.physDev, unsafeAddr deviceCreateInfo, nil, addr Vk.device)
+      vk.physDev, unsafeAddr deviceCreateInfo, nil, addr vk.device)
 
   echo "Created VkDevice"
 
   block getQueue:
-    vkGetDeviceQueue(Vk.device, Vk.queueIdx, 0, addr Vk.queue)
-    assert not isNullHandle(Vk.queue)
+    vkGetDeviceQueue(vk.device, vk.queueIdx, 0, addr vk.queue)
+    assert not isNullHandle(vk.queue)
 
   # TODO:
   #   - [ ] Create semaphores for image available and rendering complete
@@ -225,22 +225,43 @@ proc initVulkan(): bool =
   # And maybe:
   #   - [ ] Refactor init/destruct code into a constructor+destructor.
   #         See: https://nim-lang.org/docs/destructors.html
+
+  proc createSemaphore(): VkSemaphore =
+    var info = VkSemaphoreCreateInfo(
+      sType: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+    )
+    vkCheck vkCreateSemaphore(vk.device, addr info, nil, addr result)
+
+  vk.semImageWritable = createSemaphore()
+  vk.semRenderDone    = createSemaphore()
+
+  echo "Created VkSemaphores"
+
   true
 
 
 proc destroyVulkan() =
-  if not isNullHandle(Vk.device):
+  if not isNullHandle vk.semImageWritable:
+    echo "Destroying VkSemaphore - image writable"
+    vkDestroySemaphore vk.device, vk.semImageWritable, nil
+
+  if not isNullHandle vk.semRenderDone:
+    echo "Destroying VkSemaphore - render done"
+    vkDestroySemaphore vk.device, vk.semRenderDone, nil
+
+  if not isNullHandle(vk.device):
     echo "Destroying VkDevice"
-    vkCheck vkDeviceWaitIdle(Vk.device)
-    vkDestroyDevice(Vk.device, nil)
+    vkCheck vkDeviceWaitIdle(vk.device)
+    vkDestroyDevice(vk.device, nil)
 
-  if not isNullHandle(Vk.surface):
+  if not isNullHandle(vk.surface):
     echo "Destroying VkSurfaceKHR"
-    vkDestroySurfaceKHR(Vk.instance, Vk.surface, nil)
+    vkDestroySurfaceKHR(vk.instance, vk.surface, nil)
 
-  if not isNullHandle(Vk.instance):
+  if not isNullHandle(vk.instance):
     echo "Destroying VkInstance"
-    vkDestroyInstance(Vk.instance, nil)
+    vkDestroyInstance(vk.instance, nil)
+
 
 
 when isMainModule:
