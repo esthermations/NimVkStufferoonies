@@ -1,7 +1,8 @@
-import pkg/nimgl/[glfw, vulkan]
-import std/sequtils
-from std/bitops import bitand
+import
+  pkg/nimgl/[glfw, vulkan]
 
+import
+  std/[sequtils, typetraits, bitops]
 
 # Config
 const
@@ -22,7 +23,11 @@ proc vkCheck(result: VkResult) =
 func hasBits[T1, T2](value: T1, mask: T2): bool =
   bitand(uint32(value), uint32(mask)) == uint32(mask)
 
-func isNullHandle[T](handle: T): bool =
+type
+  SomeVkHandle = concept handleT
+    distinctBase(handleT, false) == VkHandle
+
+converter isNotNullHandle(handle: SomeVkHandle): bool =
   VkHandle(handle) == VkHandle(0)
 
 type
@@ -287,7 +292,7 @@ proc initVulkan(): bool =
         vk.physDev = dev
         break selectPhysicalDevice
 
-  assert not vk.physDev.isNullHandle
+  assert vk.physDev
   echo "Created VkPhysicalDevice"
 
   loadVK_KHR_surface()
@@ -315,7 +320,9 @@ proc initVulkan(): bool =
         hasQueuesAvailable = props.queueCount > 0
         hasGraphicsQueue   = props.queueFlags.hasBits(VK_QUEUE_GRAPHICS_BIT)
 
-      echo "VkDeviceQueue: Queue ", $i, ": hasQueuesAvailable = ", $hasQueuesAvailable, ", hasGraphicsQueue = ", $hasGraphicsQueue
+      echo "VkDeviceQueue: Queue ", $i,
+        ": hasQueuesAvailable = ", $hasQueuesAvailable,
+        ", hasGraphicsQueue = ", $hasGraphicsQueue
 
       if hasQueuesAvailable and hasGraphicsQueue and uint32(supportsPresent) == uint32(VK_TRUE):
         vk.queueIdx = i
@@ -356,10 +363,10 @@ proc initVulkan(): bool =
 
   block getQueue:
     vkGetDeviceQueue(vk.device, vk.queueIdx, 0, addr vk.queue)
-    assert not isNullHandle(vk.queue)
+    assert vk.queue
 
   # TODO:
-  #   - [z] Create semaphores for image available and rendering complete
+  #   - [x] Create semaphores for image available and rendering complete
   #   - [ ] Create swapchain with all its images and whatnot
   #   - [ ] Allocate command buffers
   #   - [ ] Write some simple shaders
@@ -369,44 +376,40 @@ proc initVulkan(): bool =
   #   - [ ] Refactor init/destruct code into a constructor+destructor.
   #         See: https://nim-lang.org/docs/destructors.html
 
-  proc createSemaphore(): VkSemaphore =
+  proc createSemaphore(dev: VkDevice): VkSemaphore =
     var info = VkSemaphoreCreateInfo(
       sType: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
     )
-    vkCheck vkCreateSemaphore(vk.device, addr info, nil, addr result)
+    vkCheck vkCreateSemaphore(dev, addr info, nil, addr result)
 
-  vk.semImageWritable = createSemaphore()
-  vk.semRenderDone    = createSemaphore()
+  vk.semImageWritable = createSemaphore dev
+  vk.semRenderDone    = createSemaphore dev
 
   echo "Created VkSemaphores"
-
-
   true
 
 
 proc destroyVulkan() =
-  if not isNullHandle vk.semImageWritable:
+  if vk.semImageWritable:
     echo "Destroying VkSemaphore - image writable"
     vkDestroySemaphore vk.device, vk.semImageWritable, nil
 
-  if not isNullHandle vk.semRenderDone:
+  if vk.semRenderDone:
     echo "Destroying VkSemaphore - render done"
     vkDestroySemaphore vk.device, vk.semRenderDone, nil
 
-  if not isNullHandle(vk.device):
+  if vk.device:
     echo "Destroying VkDevice"
     vkCheck vkDeviceWaitIdle(vk.device)
     vkDestroyDevice(vk.device, nil)
 
-  if not isNullHandle(vk.surface):
+  if vk.surface:
     echo "Destroying VkSurfaceKHR"
     vkDestroySurfaceKHR(vk.instance, vk.surface, nil)
 
-  if not isNullHandle(vk.instance):
+  if vk.instance:
     echo "Destroying VkInstance"
     vkDestroyInstance(vk.instance, nil)
-
-
 
 when isMainModule:
   main()
