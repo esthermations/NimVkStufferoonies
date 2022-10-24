@@ -1,7 +1,5 @@
 import
-  pkg/nimgl/[glfw, vulkan]
-
-import
+  pkg/nimgl/[glfw, vulkan],
   std/[sequtils, typetraits, bitops]
 
 # Config
@@ -20,28 +18,36 @@ proc vkCheck(result: VkResult) =
     echo "vkCheck: ", $result
     doAssert result == VK_SUCCESS
 
+## Grab a pointer to the start of this seq. Presumably you're about to read from
+## or write to this pointer - make sure you've called setLen on it first.
+func seqAddr[T](s: var seq[T]): ptr T =
+  addr s[0]
+
 func hasBits[T1, T2](value: T1, mask: T2): bool =
   bitand(uint32(value), uint32(mask)) == uint32(mask)
 
-type
-  SomeVkHandle = concept handleT
-    distinctBase(handleT, false) == VkHandle
-
-converter isNotNullHandle(handle: SomeVkHandle): bool =
+func isNull[T](handle: T): bool =
+  static: assert distinctBase(typedesc[T]) is VkHandle
   VkHandle(handle) == VkHandle(0)
 
 type
-  Swapchain[numImages: static[uint]] = object
+  SwapchainFrameData = object
+    imageView    : VkImageView
+    framebuffer  : VkFramebuffer
+    descriptorSet: VkDescriptorSet
+    uniformBuffer: VkBuffer
+    commandBuffer: VkCommandBuffer
+
+  Swapchain = object
     handle        : VkSwapchainKHR
     renderPass    : VkRenderPass
     descriptorPool: VkDescriptorPool
     pipeline      : VkPipeline
+    numFrames     : uint
+    frameData     : seq[SwapchainFrameData]
 
-    imageViews    : array[numImages, VkImageView]
-    framebuffers  : array[numImages, VkFramebuffer]
-    descriptorSets: array[numImages, VkDescriptorSet]
-    uniformBuffers: array[numImages, VkBuffer]
-    commandBuffers: array[numImages, VkCommandBuffer]
+proc setNumFrames(sc: var Swapchain, numFrames: uint) =
+  sc.frameData.setLen numFrames
 
 proc getSurfaceCapabilities(physDev: VkPhysicalDevice, surface: VkSurfaceKHR): VkSurfaceCapabilitiesKHR =
   vkCheck vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physDev, surface, addr result)
@@ -52,12 +58,11 @@ proc getNumFormats(pd: VkPhysicalDevice, s: VkSurfaceKHR): uint32 =
 proc getFormats(pd: VkPhysicalDevice, s: VkSurfaceKHR): seq[VkSurfaceFormatKHR] =
   var num = getNumFormats(pd, s)
   result.setLen num
-  vkCheck vkGetPhysicalDeviceSurfaceFormatsKHR(pd, s, addr num, addr result[0])
+  vkCheck vkGetPhysicalDeviceSurfaceFormatsKHR(pd, s, addr num, result.seqAddr)
 
 func selectSurfaceFormat(candidates: seq[VkSurfaceFormatKHR]): VkSurfaceFormatKHR =
-  let a = candidates.filterIt(it.format == kDesiredSurfaceFormat)
-  let b = a.filterIt(it.colorSpace == kDesiredSurfaceColourSpace)
-  b[0]
+  candidates.filterIt(it.format == kDesiredSurfaceFormat)
+            .filterIt(it.colorSpace == kDesiredSurfaceColourSpace)[0]
 
 proc getNumPresentModes(pd: VkPhysicalDevice, s: VkSurfaceKHR): uint32 =
   vkCheck vkGetPhysicalDeviceSurfacePresentModesKHR(pd, s, addr result, nil)
@@ -65,7 +70,7 @@ proc getNumPresentModes(pd: VkPhysicalDevice, s: VkSurfaceKHR): uint32 =
 proc getPresentModes(pd: VkPhysicalDevice, s: VkSurfaceKHR): seq[VkPresentModeKHR] =
   var num = getNumPresentModes(pd, s)
   result.setLen num
-  vkCheck vkGetPhysicalDeviceSurfacePresentModesKHR(pd, s, addr num, addr result[0])
+  vkCheck vkGetPhysicalDeviceSurfacePresentModesKHR(pd, s, addr num, result.seqAddr)
 
 func selectPresentMode(candidates: seq[VkPresentModeKHR]): VkPresentModeKHR =
   if kDesiredPresentMode in candidates:
@@ -90,29 +95,29 @@ proc createSwapchainHandle(
     surfaceFormat = selectSurfaceFormat(getFormats(pd, surface))
   var
     info = VkSwapchainCreateInfoKHR(
-      surface: surface,
-      minImageCount: caps.minImageCount,
-      imageFormat: surfaceFormat.format,
-      imageColorSpace: surfaceFormat.colorSpace,
-      imageExtent: selectExtent(window, caps),
-      imageArrayLayers: 1,
-      imageUsage: VkImageUsageFlags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
-      imageSharingMode: VK_SHARING_MODE_EXCLUSIVE,
-      queueFamilyIndexCount: 0,
-      pQueueFamilyIndices: nil,
-      preTransform: caps.currentTransform,
-      compositeAlpha: VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-      presentMode: selectPresentMode(getPresentModes(pd, surface)),
-      clipped: VkBool32(true),
-      oldSwapchain: VkSwapchainKHR(0)
+      surface               : surface,
+      minImageCount         : caps.minImageCount,
+      imageFormat           : surfaceFormat.format,
+      imageColorSpace       : surfaceFormat.colorSpace,
+      imageExtent           : selectExtent(window, caps),
+      imageArrayLayers      : 1,
+      imageUsage            : VkImageUsageFlags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
+      imageSharingMode      : VK_SHARING_MODE_EXCLUSIVE,
+      queueFamilyIndexCount : 0,
+      pQueueFamilyIndices   : nil,
+      preTransform          : caps.currentTransform,
+      compositeAlpha        : VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+      presentMode           : selectPresentMode(getPresentModes(pd, surface)),
+      clipped               : VkBool32(true),
+      oldSwapchain          : VkSwapchainKHR(0)
     )
   vkCheck vkCreateSwapchainKHR(device, addr info, nil, addr result)
 
 proc createImageView(
-  dev: VkDevice,
-  image: VkImage,
-  format: VkFormat,
-  aspectMask: VkImageAspectFlags
+  dev        : VkDevice,
+  image      : VkImage,
+  format     : VkFormat,
+  aspectMask : VkImageAspectFlags
 ): VkImageView =
   var info = VkImageViewCreateInfo(
     image: image,
@@ -125,28 +130,28 @@ proc createImageView(
       a: VK_COMPONENT_SWIZZLE_IDENTITY,
     ),
     subresourceRange: VkImageSubresourceRange(
-      aspectMask: aspectMask,
-      baseMipLevel: 0,
-      levelCount: 1,
-      baseArrayLayer: 0,
-      layerCount: 1
+      aspectMask     : aspectMask,
+      baseMipLevel   : 0,
+      levelCount     : 1,
+      baseArrayLayer : 0,
+      layerCount     : 1
     )
   )
   vkCheck vkCreateImageView(dev, addr info, nil, addr result)
 
-proc createImageViews(
+proc createSwapchainFrameData(
   sc: VkSwapchainKHR,
   dev: VkDevice,
   pd: VkPhysicalDevice,
   surface: VkSurfaceKHR
-): seq[VkImageView] =
+): seq[SwapchainFrameData] =
   var
     numImages: uint32
     images: seq[VkImage]
 
   vkCheck vkGetSwapchainImagesKHR(dev, sc, addr numImages, nil)
   images.setLen numImages
-  vkCheck vkGetSwapchainImagesKHR(dev, sc, addr numImages, addr images[0])
+  vkCheck vkGetSwapchainImagesKHR(dev, sc, addr numImages, images.seqAddr)
 
   let format = selectSurfaceFormat(getFormats(pd, surface)).format
   result.setLen numImages
@@ -161,9 +166,9 @@ proc createSwapchain(
   window: GLFWwindow,
   surface: VKSurfaceKHR
 ): Swapchain =
-  vkDeviceWaitIdle(device)
-  result.handle = createSwapchainHandle(device, pd, window, surface)
-  result.imageViews = createImageViews(result.handle)
+  vkCheck vkDeviceWaitIdle(device)
+  result.handle = createSwapchainHandle(pd, device, window, surface)
+  result.imageViews = createImageViews(result.handle, device, pd, surface)
 
   # TODO
 
@@ -270,7 +275,7 @@ proc initVulkan(): bool =
   vkCheck vkEnumeratePhysicalDevices(vk.instance, addr numPhysicalDevices, nil)
   physicalDevices.setLen numPhysicalDevices
   vkCheck vkEnumeratePhysicalDevices(
-    vk.instance, addr numPhysicalDevices, addr physicalDevices[0])
+    vk.instance, addr numPhysicalDevices, physicalDevices.seqAddr)
 
   const requiredDeviceExtensions = @[ "VK_KHR_swapchain", "VK_KHR_maintenance1" ]
 
@@ -292,7 +297,7 @@ proc initVulkan(): bool =
         vk.physDev = dev
         break selectPhysicalDevice
 
-  assert vk.physDev
+  assert not vk.physDev.isNull
   echo "Created VkPhysicalDevice"
 
   loadVK_KHR_surface()
@@ -309,7 +314,7 @@ proc initVulkan(): bool =
     var queueFamilyProps: seq[VkQueueFamilyProperties]
     queueFamilyProps.setLen numQueueFamilies
     vkGetPhysicalDeviceQueueFamilyProperties(
-      vk.physDev, addr numQueueFamilies, addr queueFamilyProps[0])
+      vk.physDev, addr numQueueFamilies, queueFamilyProps.seqAddr)
 
     for i in 0 ..< numQueueFamilies:
       var supportsPresent: VkBool32 = VkBool32(VK_FALSE)
@@ -363,7 +368,7 @@ proc initVulkan(): bool =
 
   block getQueue:
     vkGetDeviceQueue(vk.device, vk.queueIdx, 0, addr vk.queue)
-    assert vk.queue
+    assert not vk.queue.isNull
 
   # TODO:
   #   - [x] Create semaphores for image available and rendering complete
@@ -382,32 +387,32 @@ proc initVulkan(): bool =
     )
     vkCheck vkCreateSemaphore(dev, addr info, nil, addr result)
 
-  vk.semImageWritable = createSemaphore dev
-  vk.semRenderDone    = createSemaphore dev
+  vk.semImageWritable = createSemaphore vk.device
+  vk.semRenderDone    = createSemaphore vk.device
 
   echo "Created VkSemaphores"
   true
 
 
 proc destroyVulkan() =
-  if vk.semImageWritable:
+  if not vk.semImageWritable.isNull:
     echo "Destroying VkSemaphore - image writable"
     vkDestroySemaphore vk.device, vk.semImageWritable, nil
 
-  if vk.semRenderDone:
+  if not vk.semRenderDone.isNull:
     echo "Destroying VkSemaphore - render done"
     vkDestroySemaphore vk.device, vk.semRenderDone, nil
 
-  if vk.device:
+  if not vk.device.isNull:
     echo "Destroying VkDevice"
     vkCheck vkDeviceWaitIdle(vk.device)
     vkDestroyDevice(vk.device, nil)
 
-  if vk.surface:
+  if not vk.surface.isNull:
     echo "Destroying VkSurfaceKHR"
     vkDestroySurfaceKHR(vk.instance, vk.surface, nil)
 
-  if vk.instance:
+  if not vk.instance.isNull:
     echo "Destroying VkInstance"
     vkDestroyInstance(vk.instance, nil)
 
