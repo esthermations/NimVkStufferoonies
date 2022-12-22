@@ -6,7 +6,6 @@ proc keyEventCallback(window: GLFWWindow, key, scancode, action, mods: int32) {.
     if key == GLFWKey.ESCAPE:
       window.setWindowShouldClose(true)
 
-
 template vkCheck(result: VkResult) =
   if result != VK_SUCCESS:
     echo "vkCheck: ", $result
@@ -14,7 +13,6 @@ template vkCheck(result: VkResult) =
 
 func vkHasBits[T1, T2](value: T1, mask: T2): bool =
   bitand(uint32(value), uint32(mask)) == uint32(mask)
-
 
 func isNullHandle[T](handle: T): bool =
   VkHandle(handle) == VkHandle(0)
@@ -38,12 +36,10 @@ type
 # this doesn't seem too bad.
 var vk : VulkanState
 
-
 # Forward decls, which for some sad reason are necessary in the year of our
 # lord 2022
 proc initVulkan(): bool
 proc destroyVulkan()
-
 
 proc main() =
   assert glfwInit()
@@ -76,8 +72,8 @@ proc initVulkan(): bool =
   doAssert vkInit(load1_0 = true, load1_1 = true)
 
   var
-    requiredInstanceExtensions = @[ "VK_EXT_debug_utils" ]
-    requiredLayers             = @[ "VK_LAYER_KHRONOS_validation" ]
+    requiredInstanceExtensions  = @[ "VK_EXT_debug_utils" ]
+    requiredLayers: seq[string] = @[] # "VK_LAYER_KHRONOS_validation" ]
 
     numGlfwInstanceExtensions : uint32 = 0
 
